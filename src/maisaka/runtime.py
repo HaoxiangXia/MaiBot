@@ -1632,7 +1632,19 @@ class MaisakaHeartFlowChatting(MaisakaRuntimeDisplayMixin):
         return pending_messages
 
     async def _consume_pending_messages_silently(self, count: Optional[int] = None) -> int:
-        """门控判定静默已读时推进 _last_processed_index，把消息同步入历史并裁剪缓存，不进入 Planner。"""
+        """门控判定静默已读时推进 _last_processed_index，把消息同步入历史并裁剪缓存，不进入 Planner。
+
+        Args:
+            count: 期望静默消费的消息条数；为空或小于等于 0 时默认消费至当前全部待处理消息。
+
+        Returns:
+            int: 实际完成静默消费并接入历史的消息条数。
+        """
+
+        # 若当前正处于运行中状态（Planner 正在思考或生成回复），推迟静默消费，避免与 Planner 并发修改 _chat_history
+        while getattr(self, "_agent_state", "") == getattr(self, "_STATE_RUNNING", "running") and getattr(self, "_running", True):
+            await asyncio.sleep(0.1)
+
         start_index = self._last_processed_index
         total = len(self.message_cache)
         if start_index >= total:
@@ -1643,9 +1655,7 @@ class MaisakaHeartFlowChatting(MaisakaRuntimeDisplayMixin):
         if not consumed_messages:
             return 0
 
-        self._last_processed_index = target
-        if target >= total:
-            self._fixed_message_debouncer.consume()
+        # 先将消息接入历史，避免任务取消或执行异常时游标已推进但历史未记录
         if hasattr(self, "_reasoning_engine") and self._reasoning_engine is not None:
             await self._reasoning_engine._ingest_messages(consumed_messages)
             cycle_detail = CycleDetail(cycle_id=self._cycle_counter)
@@ -1653,9 +1663,12 @@ class MaisakaHeartFlowChatting(MaisakaRuntimeDisplayMixin):
                 cycle_detail,
                 enable_compaction=False,
             )
+
+        self._last_processed_index = target
+        if target >= total:
+            self._fixed_message_debouncer.consume()
         self._prune_processed_message_cache()
         return len(consumed_messages)
-
     def _get_message_quiet_period_remaining_seconds(self) -> float:
         """返回本批消息距离防抖截止还需等待的秒数；关闭防抖或批次已到期时为 0。"""
         if not self._is_message_debounce_enabled():

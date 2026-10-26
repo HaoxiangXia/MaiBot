@@ -126,7 +126,7 @@ class DynamicReplyTurnGate:
 
         eval_time = time.time() if now is None else now
         clamped_probability = min(1.0, max(0.0, float(probability)))
-        if self._gate.is_round_open(eval_time) and self._gate._proactive_scores:
+        if self._gate.is_round_open(eval_time) and self._gate.has_proactive_demand:
             self._gate.record_proactive_demand(clamped_probability, eval_time)
         gate_decision = self._gate.evaluate(clamped_probability, frequency, eval_time)
         effective_threshold = (

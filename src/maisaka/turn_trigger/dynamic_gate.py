@@ -123,6 +123,12 @@ class DynamicReplyGate:
 
         return self._open_round_started_at is not None and now - self._open_round_started_at < VIRTUAL_ROUND_SECONDS
 
+    @property
+    def has_proactive_demand(self) -> bool:
+        """当前窗口内是否已有记录的主动回复需求。"""
+
+        return bool(self._proactive_scores)
+
     def record_proactive_demand(self, probability: float, now: float) -> None:
         """记录当前虚拟轮次预计带来的 reply 次数。
 

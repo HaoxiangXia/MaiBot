@@ -12,6 +12,7 @@ from src.plugin_runtime.host.hook_spec_registry import HookSpecRegistry
 
 
 def test_turn_trigger_evaluate_hook_spec_registered() -> None:
+    """验证 maisaka.turn_trigger.evaluate HookSpec 成功注册且属性正确。"""
     registry = HookSpecRegistry()
     register_maisaka_hook_specs(registry)
     spec = registry.get_hook_spec(TURN_TRIGGER_EVALUATE_HOOK)
@@ -21,6 +22,7 @@ def test_turn_trigger_evaluate_hook_spec_registered() -> None:
 
 
 def test_dynamic_reply_turn_gate_apply_external_probability() -> None:
+    """验证 apply_external_probability 正确重算动态门控判定与阈值覆盖。"""
     runtime = SimpleNamespace(
         log_prefix="[测试群聊]",
         chat_stream=SimpleNamespace(is_group_session=True),
@@ -36,8 +38,10 @@ def test_dynamic_reply_turn_gate_apply_external_probability() -> None:
     assert low_res.threshold == pytest.approx(0.6)
 
 
+
 @pytest.mark.asyncio
 async def test_scheduler_hook_probability_fusion_and_silent_consume(monkeypatch: pytest.MonkeyPatch) -> None:
+    """验证调度器处理 Hook 概率融合放行及静默消费判定。"""
     monkeypatch.setattr(
         scheduler_module,
         "global_config",
@@ -56,6 +60,7 @@ async def test_scheduler_hook_probability_fusion_and_silent_consume(monkeypatch:
     consumed_records: list[int | None] = []
 
     async def fake_consume(count: int | None = None) -> int:
+        """模拟静默消费消息并记录消费数量。"""
         consumed_records.append(count)
         runtime._last_processed_index = len(runtime.message_cache)
         return 1
@@ -104,7 +109,7 @@ async def test_scheduler_hook_probability_fusion_and_silent_consume(monkeypatch:
         probability=0.32,
         threshold=0.50,
     )
-    await scheduler._run_hook_evaluation(base_result=base_result, start_index=0, target_index=1)
+    await scheduler._run_hook_evaluation(base_result=base_result, start_index=0, target_index=1, target_message=msg)
 
     assert consumed_records == [1]
     assert runtime._last_processed_index == 1
@@ -125,12 +130,13 @@ async def test_scheduler_hook_probability_fusion_and_silent_consume(monkeypatch:
             kwargs={"probability": 0.88, "threshold": 0.50, "detail": "Jev融合 p=0.88"},
         )
     )
-    await scheduler._run_hook_evaluation(base_result=base_result, start_index=1, target_index=2)
+    await scheduler._run_hook_evaluation(base_result=base_result, start_index=1, target_index=2, target_message=msg2)
     runtime._enqueue_message_turn.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_runtime_consume_pending_messages_silently() -> None:
+    """验证 runtime._consume_pending_messages_silently 正确推进游标并调用历史写入。"""
     runtime = object.__new__(MaisakaHeartFlowChatting)
     msg1 = SimpleNamespace(message_id="1")
     msg2 = SimpleNamespace(message_id="2")
@@ -149,3 +155,40 @@ async def test_runtime_consume_pending_messages_silently() -> None:
     assert runtime._last_processed_index == 2
     runtime._fixed_message_debouncer.consume.assert_called_once()
     runtime._reasoning_engine._ingest_messages.assert_awaited_once_with([msg1, msg2])
+
+
+def test_scheduler_evaluates_new_messages_after_cache_pruning() -> None:
+    """验证当 message_cache 发生修剪时，动态下标解析不会遗漏新消息评估。"""
+    msg_old = SimpleNamespace(message_id="old_1")
+    msg_new = SimpleNamespace(message_id="new_2")
+    runtime = SimpleNamespace(
+        message_cache=[msg_old],
+        _last_processed_index=0,
+        log_prefix="[test]",
+    )
+    scheduler = MessageTurnScheduler(runtime)
+    scheduler._hook_evaluated_message = msg_old
+    assert scheduler._get_evaluated_target_index() == 1
+
+    # 模拟缓存修剪淘汰旧消息，并追加新消息
+    runtime.message_cache = [msg_new]
+    # 由于旧消息已被淘汰，动态解析返回 0，确保新消息不会被判定为已评估
+    assert scheduler._get_evaluated_target_index() == 0
+
+
+def test_scheduler_consume_count_sanitization_fallback() -> None:
+    """验证当 Hook 返回非正数的 consumed_count 时回退到默认消费数量。"""
+    scheduler = MessageTurnScheduler(SimpleNamespace())
+    base_result = TurnGateResult(decision="wait", detail="测试")
+    hook_result = SimpleNamespace(
+        aborted=False,
+        kwargs={"decision": "consume", "consumed_count": -5},
+    )
+    res = scheduler._resolve_hook_result(
+        base_result=base_result,
+        hook_result=hook_result,
+        frequency=0.5,
+        default_consumed_count=3,
+    )
+    assert res.decision == "consume"
+    assert res.consumed_count == 3

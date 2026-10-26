@@ -32,8 +32,25 @@ class MessageTurnScheduler:
         self._runtime = runtime
         self._dynamic_reply_gate = DynamicReplyTurnGate(runtime)
         self._hook_eval_task: Optional[asyncio.Task[None]] = None
-        self._hook_evaluated_target_index: int = 0
+        self._hook_evaluated_message: Optional[Any] = None
 
+    def _get_evaluated_target_index(self) -> int:
+        """根据最后一条已评估消息动态获取其在当前 message_cache 中的下一个处理下标。
+
+        Returns:
+            int: 已评估消息在当前缓存中的切片终点下标；若无记录或消息已被裁剪弹出，则返回 0。
+        """
+
+        if self._hook_evaluated_message is None:
+            return 0
+        cache = self._runtime.message_cache
+        for idx in range(len(cache) - 1, -1, -1):
+            msg = cache[idx]
+            if msg is self._hook_evaluated_message or getattr(msg, "message_id", None) == getattr(
+                self._hook_evaluated_message, "message_id", ""
+            ):
+                return idx + 1
+        return 0
     @staticmethod
     def _get_runtime_manager() -> Any:
         """获取插件运行时管理器单例。"""
@@ -43,16 +60,23 @@ class MessageTurnScheduler:
         return get_plugin_runtime_manager()
 
     def _has_evaluate_hook_subscribers(self) -> bool:
-        """检查当前是否有插件订阅了门控评估 Hook。"""
+        """检查当前是否有插件订阅了门控评估 Hook。
+
+        Returns:
+            bool: 存在有效订阅者时返回 True。
+        """
 
         try:
             manager = self._get_runtime_manager()
             dispatcher = getattr(manager, "_hook_dispatcher", None)
             if dispatcher is None:
                 return False
+            if hasattr(dispatcher, "has_hook_subscribers") and callable(dispatcher.has_hook_subscribers):
+                return bool(dispatcher.has_hook_subscribers(TURN_TRIGGER_EVALUATE_HOOK))
             supervisors = dispatcher._resolve_supervisors()
             return bool(dispatcher._collect_invocation_targets(TURN_TRIGGER_EVALUATE_HOOK, supervisors))
-        except Exception:
+        except Exception as exc:
+            logger.debug(f"{self._runtime.log_prefix} 检查门控 Hook 订阅者失败: {exc}")
             return False
 
     def cancel_pending_tasks(self) -> None:
@@ -140,7 +164,12 @@ class MessageTurnScheduler:
         return self._has_evaluate_hook_subscribers()
 
     def _schedule_hook_evaluation(self, base_result: TurnGateResult, pending_count: int) -> None:
-        """安排一次异步门控 Hook 调用，避免对同一批待处理消息重复发起远程请求。"""
+        """安排一次异步门控 Hook 调用，避免对同一批待处理消息重复发起远程请求。
+
+        Args:
+            base_result: 本地动态门控产生的基准判定结果。
+            pending_count: 当前待处理外部消息数量。
+        """
 
         runtime = self._runtime
         if self._hook_eval_task is not None and not self._hook_eval_task.done():
@@ -149,16 +178,18 @@ class MessageTurnScheduler:
 
         start_index = runtime._last_processed_index
         target_index = len(runtime.message_cache)
-        self._hook_evaluated_target_index = max(self._hook_evaluated_target_index, start_index)
-        if target_index <= self._hook_evaluated_target_index:
+        evaluated_index = max(self._get_evaluated_target_index(), start_index)
+        if target_index <= evaluated_index:
             logger.debug(f"{runtime.log_prefix} 待处理消息已由门控 Hook 评估过，等待新消息")
             return
 
+        target_message = runtime.message_cache[target_index - 1] if target_index > 0 else None
         self._hook_eval_task = asyncio.create_task(
             self._run_hook_evaluation(
                 base_result=base_result,
                 start_index=start_index,
                 target_index=target_index,
+                target_message=target_message,
             )
         )
 
@@ -168,8 +199,16 @@ class MessageTurnScheduler:
         base_result: TurnGateResult,
         start_index: int,
         target_index: int,
+        target_message: Optional[Any] = None,
     ) -> None:
-        """在异步任务中调用 maisaka.turn_trigger.evaluate 并应用合并结果。"""
+        """在异步任务中调用 maisaka.turn_trigger.evaluate 并应用合并结果。
+
+        Args:
+            base_result: 本地动态门控产生的基准判定结果。
+            start_index: 本次待评估消息在缓存中的起始下标。
+            target_index: 本次待评估消息在缓存中的目标终止下标。
+            target_message: 本次评估覆盖的最后一条消息对象引用。
+        """
 
         runtime = self._runtime
         try:
@@ -199,7 +238,7 @@ class MessageTurnScheduler:
                 pending_messages=self._serialize_pending_messages(pending_messages),
                 recent_messages=self._serialize_recent_history(),
             )
-            self._hook_evaluated_target_index = max(self._hook_evaluated_target_index, target_index)
+            self._hook_evaluated_message = target_message
 
             if not getattr(runtime, "_running", True) or runtime._message_turn_scheduled:
                 return
@@ -227,6 +266,7 @@ class MessageTurnScheduler:
             raise
         except Exception as exc:
             logger.warning(f"{runtime.log_prefix} 门控 Hook 评估异常，回退本地判定: {exc}", exc_info=True)
+            self._hook_evaluated_message = target_message
             if getattr(runtime, "_running", True) and not runtime._message_turn_scheduled:
                 self._apply_turn_gate_result(base_result, runtime._get_pending_message_count())
         finally:
@@ -234,11 +274,10 @@ class MessageTurnScheduler:
             if (
                 getattr(runtime, "_running", True)
                 and not runtime._message_turn_scheduled
-                and len(runtime.message_cache) > self._hook_evaluated_target_index
+                and len(runtime.message_cache) > self._get_evaluated_target_index()
                 and runtime._get_pending_message_count() > 0
             ):
                 self.schedule_message_turn()
-
     def _resolve_hook_result(
         self,
         *,
@@ -273,7 +312,8 @@ class MessageTurnScheduler:
         decision_explicitly_changed = raw_decision != base_result.decision
 
         if raw_decision == "consume":
-            consumed_count = self._coerce_int(kwargs.get("consumed_count"), default_consumed_count)
+            raw_count = self._coerce_int(kwargs.get("consumed_count"), default_consumed_count)
+            consumed_count = raw_count if raw_count > 0 else default_consumed_count
             self._dynamic_reply_gate.close_round()
             return TurnGateResult(
                 decision="consume",
@@ -367,6 +407,16 @@ class MessageTurnScheduler:
 
     @staticmethod
     def _coerce_float(value: Any, default: float) -> float:
+        """将任意输入安全转换为浮点数。
+
+        Args:
+            value: 待转换的值。
+            default: 转换失败时的默认值。
+
+        Returns:
+            float: 转换后的浮点数值。
+        """
+
         if value is None or isinstance(value, bool):
             return default
         try:
@@ -376,13 +426,22 @@ class MessageTurnScheduler:
 
     @staticmethod
     def _coerce_int(value: Any, default: int) -> int:
+        """将任意输入安全转换为整数。
+
+        Args:
+            value: 待转换的值。
+            default: 转换失败时的默认值。
+
+        Returns:
+            int: 转换后的整数值。
+        """
+
         if value is None or isinstance(value, bool):
             return default
         try:
             return int(value)
         except (TypeError, ValueError):
             return default
-
     def _evaluate(self, pending_count: int) -> TurnGateResult:
         """按流水线顺序返回第一个给出结论的判定。"""
 
