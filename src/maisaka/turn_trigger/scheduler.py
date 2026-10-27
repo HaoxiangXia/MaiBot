@@ -313,7 +313,7 @@ class MessageTurnScheduler:
 
         if raw_decision == "consume":
             raw_count = self._coerce_int(kwargs.get("consumed_count"), default_consumed_count)
-            consumed_count = raw_count if raw_count > 0 else default_consumed_count
+            consumed_count = min(default_consumed_count, raw_count) if raw_count > 0 else default_consumed_count
             self._dynamic_reply_gate.close_round()
             return TurnGateResult(
                 decision="consume",

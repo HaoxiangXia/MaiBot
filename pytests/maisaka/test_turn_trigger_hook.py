@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -144,6 +145,7 @@ async def test_runtime_consume_pending_messages_silently() -> None:
     runtime._last_processed_index = 0
     runtime._cycle_counter = 1
     runtime.log_prefix = "[test]"
+    runtime._message_ingest_lock = asyncio.Lock()
     runtime._fixed_message_debouncer = SimpleNamespace(consume=Mock())
     runtime._reasoning_engine = SimpleNamespace(
         _ingest_messages=AsyncMock(),
@@ -192,3 +194,16 @@ def test_scheduler_consume_count_sanitization_fallback() -> None:
     )
     assert res.decision == "consume"
     assert res.consumed_count == 3
+
+    # 当返回正数大于 default_consumed_count 时，截断为 default_consumed_count
+    hook_result_large = SimpleNamespace(
+        aborted=False,
+        kwargs={"decision": "consume", "consumed_count": 99},
+    )
+    res_large = scheduler._resolve_hook_result(
+        base_result=base_result,
+        hook_result=hook_result_large,
+        frequency=0.5,
+        default_consumed_count=3,
+    )
+    assert res_large.consumed_count == 3
